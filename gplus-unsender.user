@@ -1,0 +1,1411 @@
+// ==UserScript==
+// @name         G+ Unsender
+// @namespace    https://github.com/
+// @version      1.0
+// @description  Mass unsender for Messenger. Header G+ button, simple UI, Light/Dark mode, chat safety, auto-stop.
+// @author       G+
+// @match        https://www.messenger.com/*
+// @match        https://www.facebook.com/messages/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    if (window.__GPLUS_UNSENDER_LOADED) return;
+    window.__GPLUS_UNSENDER_LOADED = true;
+
+    // =========================================================================
+    // SETTINGS
+    // =========================================================================
+    const CONFIG = {
+        HOVER_WAIT: 120,
+        CLICK_WAIT: 60,
+        MENU_WAIT: 900,
+        DIALOG_WAIT: 1200,
+        POST_DELETE_WAIT: 250,
+        SCROLL_WAIT: 1500,      // wait for older messages to load
+        RETRY_DELAY: 250,
+        LOOP_DELAY: 60,
+        MAX_RETRIES: 2,         // tries per message before skipping it
+        MAX_EMPTY_SCROLLS: 3    // failed loads at the very top before finishing
+    };
+
+    const settings = {
+        unsendYours: true,
+        deleteTombstones: true,
+        deleteOthers: true,
+        themeMode: localStorage.getItem('__gplus_theme') || 'auto'
+    };
+
+    let running = false;
+    let paused = false;
+    let stopped = false;
+    let lockedConvId = null;
+    let emptyTop = 0;
+
+    const stats = { yoursUnsent: 0, tombstonesDeleted: 0, othersDeleted: 0, totalCleaned: 0, skipped: 0 };
+
+    // Remembers which message elements were already handled
+    const doneMap = new WeakMap();   // element -> signature
+    const triesMap = new WeakMap();  // element -> number of failed tries
+
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const log = (...a) => console.log('%c[G+ Unsender]', 'color:#9333ea;font-weight:bold;', ...a);
+
+    // =========================================================================
+    // CONVERSATION + CHAT AREA
+    // =========================================================================
+    function getConvId() {
+        const m = location.pathname.match(/\/messages\/(?:e2ee\/)?t\/([^/?#]+)/);
+        if (m) return m[1];
+        const m2 = location.href.match(/\/t\/([^/?#]+)/);
+        return m2 ? m2[1] : (location.pathname || 'default');
+    }
+
+    function getChatLog() {
+        const candidates = [
+            ...document.querySelectorAll('[role="log"]'),
+            ...document.querySelectorAll('[role="grid"]'),
+            ...document.querySelectorAll('[data-scope="messages_table"]')
+        ];
+        const valid = candidates.filter(el => {
+            const r = el.getBoundingClientRect();
+            return r.left >= 250 && r.width >= 280 && r.top < 200 && r.bottom > 350;
+        });
+        const named = valid.find(el => /Messages/i.test(el.getAttribute('aria-label') || ''));
+        if (named) return named;
+        if (valid.length) return valid[0];
+
+        for (const row of document.querySelectorAll('[role="row"]')) {
+            const r = row.getBoundingClientRect();
+            if (r.left >= 250 && r.width >= 280) {
+                let p = row.parentElement;
+                while (p && p !== document.body) {
+                    if (p.scrollHeight > 300 && p.clientHeight > 200) return p;
+                    p = p.parentElement;
+                }
+            }
+        }
+        const main = document.querySelector('[role="main"]');
+        if (main && main.getBoundingClientRect().left >= 220) return main;
+        return null;
+    }
+
+    // The element that actually scrolls the messages
+    function getScroller() {
+        const chat = getChatLog();
+        if (!chat) return null;
+        let c = chat;
+        while (c && c !== document.documentElement) {
+            try {
+                const ov = getComputedStyle(c).overflowY;
+                if (/auto|scroll/i.test(ov) && c.scrollHeight > c.clientHeight + 10) return c;
+            } catch (_) {}
+            c = c.parentElement;
+        }
+        return chat;
+    }
+
+    // =========================================================================
+    // MESSAGE DETECTION
+    // =========================================================================
+    // Matches "You unsent a message", "You unsent a file", "X unsent an attachment", etc.
+    function isTombstoneText(text) {
+        if (!text) return false;
+        const t = text.trim();
+        if (t.length > 80) return false;
+        const kinds = '(message|messages|photo|photos|video|videos|file|files|attachment|attachments|sticker|gif|voice message|audio|link|image|images)';
+        if (new RegExp('\\b(unsent|removed|deleted)\\s+(a|an|\\d+)\\s+' + kinds, 'i').test(t)) return true;
+        if (/^(this|the)\s+(message|attachment|file|photo|video)\s+(was|has been)\s+(deleted|removed|unsent)/i.test(t)) return true;
+        if (/^(message|attachment|file|photo|video)\s+(deleted|removed|unsent)/i.test(t)) return true;
+        return false;
+    }
+
+    function isSystemHeader(text) {
+        if (!text) return false;
+        const t = text.trim();
+        if (t.length > 60) {
+            return /^(Messages and calls are secured|End-to-end encrypted)/i.test(t);
+        }
+        const dm = '(?:mon|tue|wed|thu|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*';
+        const dateTime = new RegExp('^(?:' + dm + '[,\\s]*)?(?:\\d{1,2}[,\\s]*)?(?:' + dm + '[,\\s]*)?(?:\\d{4}[,\\s]*)?(?:at\\s*)?\\d{1,2}:\\d{2}\\s*(?:am|pm)?$', 'i');
+        const dateOnly = new RegExp('^' + dm + '\\s*\\d{1,2}(,\\s*\\d{4})?$', 'i');
+        if (dateTime.test(t) || dateOnly.test(t)) return true;
+        if (/^(Yesterday|Today)$/i.test(t)) return true;
+        if (/^(seen|delivered)(\s+by\s+.*)?$/i.test(t)) return true;
+        if (/^Sent\s+\d+\w*\s+ago$/i.test(t)) return true;
+        if (/^(Messages and calls are secured|End-to-end encrypted|You're friends on Facebook|Say hi to your new Facebook friend|created the group|named the group|joined the group)/i.test(t)) return true;
+        return false;
+    }
+
+    // Real left/right edge of what is inside the message (text + big images)
+    function contentBounds(el) {
+        let left = Infinity, right = -Infinity;
+        const range = document.createRange();
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        let n;
+        while ((n = walker.nextNode())) {
+            const t = (n.nodeValue || '').trim();
+            if (!t || isSystemHeader(t)) continue;
+            range.selectNodeContents(n);
+            const r = range.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) continue;
+            if (r.left < left) left = r.left;
+            if (r.right > right) right = r.right;
+        }
+        el.querySelectorAll('img, video, [role="img"]').forEach(m => {
+            const r = m.getBoundingClientRect();
+            if (r.width < 40 || r.height < 20) return; // skip avatars and icons
+            if (r.left < left) left = r.left;
+            if (r.right > right) right = r.right;
+        });
+        return left === Infinity ? null : { left, right };
+    }
+
+    // Color strength of the message bubble (sent bubbles are colored, received are gray)
+    function bubbleColorInfo(el) {
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        let n;
+        while ((n = walker.nextNode())) {
+            const t = (n.nodeValue || '').trim();
+            if (!t || isSystemHeader(t) || !n.parentElement) continue;
+            let node = n.parentElement;
+            while (node && node !== el.parentElement) {
+                const cs = getComputedStyle(node);
+                if (cs.backgroundImage && cs.backgroundImage !== 'none' && /gradient/i.test(cs.backgroundImage)) {
+                    return { colored: true, found: true };
+                }
+                const m = (cs.backgroundColor || '').match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+))?/i);
+                if (m && !(m[4] !== undefined && parseFloat(m[4]) < 0.3)) {
+                    const sat = Math.max(+m[1], +m[2], +m[3]) - Math.min(+m[1], +m[2], +m[3]);
+                    return { colored: sat >= 50, found: true };
+                }
+                node = node.parentElement;
+            }
+            return { colored: false, found: false };
+        }
+        return { colored: false, found: false };
+    }
+
+    // Is the message on the right (yours) or left (theirs)?
+    function bubbleSide(el) {
+        const logEl = getChatLog();
+        if (!logEl) return 'received';
+        const L = logEl.getBoundingClientRect();
+
+        // 1) A profile picture on the left side = someone else's message
+        const avatar = [...el.querySelectorAll('img')].find(i => {
+            const r = i.getBoundingClientRect();
+            return r.width >= 18 && r.width <= 40 && r.height >= 18 && r.height <= 40 &&
+                   (r.left + r.width / 2) < L.left + L.width * 0.4;
+        });
+        if (avatar) return 'received';
+
+        // 2) Where the message content sits
+        let b = contentBounds(el);
+        if (!b) {
+            const r = el.getBoundingClientRect();
+            b = { left: r.left, right: r.right };
+        }
+        const diff = (b.left - L.left) - (L.right - b.right); // > 0 means pushed to the right
+        if (Math.abs(diff) >= 25) return diff > 0 ? 'sent' : 'received';
+
+        // 3) Not clear (wide message): use the bubble color
+        const c = bubbleColorInfo(el);
+        if (c.found) return c.colored ? 'sent' : 'received';
+        return diff > 0 ? 'sent' : 'received';
+    }
+
+    function classifyMessage(el) {
+        const text = (el.innerText || el.textContent || '').trim();
+        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+
+        if (isTombstoneText(text) || aria.includes('unsent') || aria.includes('deleted a')) return 'tombstone';
+        if (aria.includes('by you') || aria.includes('you sent') || aria.includes('from you') || aria.includes('sent by you')) return 'sent';
+        return bubbleSide(el);
+    }
+
+    function signature(el) {
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 150);
+        return classifyMessage(el) + '|' + text;
+    }
+
+    // Name of the other person (from the row, else the chat title)
+    function getOtherName(el) {
+        const h = el.querySelector('h4, [role="heading"]');
+        const t = h && (h.innerText || '').trim();
+        if (t && t.length < 40) return t;
+        const head = document.querySelector('[role="main"] h1, [role="main"] h2, [role="main"] [role="heading"]');
+        const n = head && (head.innerText || '').trim().split('\n')[0];
+        if (n && n.length < 40) return n;
+        return 'Them';
+    }
+
+    function formatDate(d) {
+        const p = n => String(n).padStart(2, '0');
+        return p(d.getMonth() + 1) + '/' + p(d.getDate()) + '/' + d.getFullYear();
+    }
+
+    // Turns "Mon 10:30 PM", "OCT 12, 2025, 3:00 PM", "Yesterday", "10:30 PM" into a Date
+    function parseSeparatorDate(text) {
+        const t = (text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        if (!t || t.length > 40) return null;
+        const now = new Date();
+        const base = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+        if (/^today\b/.test(t) || /^\d{1,2}:\d{2}\s*(am|pm)?$/.test(t)) return base;
+        if (/^yesterday\b/.test(t)) { base.setDate(base.getDate() - 1); return base; }
+
+        const months = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+        const days = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+        let day, mon;
+        let m = t.match(/\b(\d{1,2})\s+([a-z]{3})[a-z]*/);
+        if (m && months.includes(m[2])) { day = +m[1]; mon = months.indexOf(m[2]); }
+        else {
+            m = t.match(/\b([a-z]{3})[a-z]*\.?\s+(\d{1,2})\b/);
+            if (m && months.includes(m[1])) { mon = months.indexOf(m[1]); day = +m[2]; }
+        }
+        if (mon !== undefined) {
+            const y = t.match(/\b(?:19|20)\d{2}\b/);
+            return new Date(y ? +y[0] : now.getFullYear(), mon, day);
+        }
+
+        const w = days.indexOf(t.slice(0, 3));
+        if (w >= 0) {
+            base.setDate(base.getDate() - ((now.getDay() - w + 7) % 7));
+            return base;
+        }
+        return null;
+    }
+
+    // Looks for a day + time in the first part of a message's text (hidden label)
+    let noDateLogs = 0;
+    function findDateInText(el) {
+        const raw = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        const mon = '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*';
+        const wd = '(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*';
+        const time = '\\d{1,2}:\\d{2}\\s*(?:am|pm)?';
+        const patterns = [
+            new RegExp('\\b(?:today|yesterday|' + wd + ')\\.?,?\\s+(?:at\\s+)?' + time, 'i'),
+            new RegExp('\\b' + mon + '\\.?\\s+\\d{1,2}(?:,?\\s+\\d{4})?(?:,?\\s+(?:at\\s+)?' + time + ')?', 'i'),
+            new RegExp('\\b\\d{1,2}\\s+' + mon + '(?:,?\\s+\\d{4})?(?:,?\\s+(?:at\\s+)?' + time + ')?', 'i')
+        ];
+        for (const re of patterns) {
+            const m = raw.match(re);
+            if (m) {
+                const d = parseSeparatorDate(m[0]);
+                if (d) return formatDate(d);
+            }
+        }
+        // only a time, e.g. "Message sent 9:41 PM" -> today
+        const t = raw.match(new RegExp('\\b(?:sent|received)\\b[^0-9]{0,40}(' + time + ')', 'i'));
+        if (t) return formatDate(parseSeparatorDate(t[1]) || new Date());
+
+        if (noDateLogs < 6) {
+            noDateLogs++;
+            log('No date found in:', JSON.stringify(raw));
+        }
+        return null;
+    }
+
+    // Date of a message = the closest date label above it (works with any page layout)
+    function findMessageDate(el) {
+        // Messenger hides a text like "Enter, Message sent Tuesday 9:41 AM" in each message
+        const fromText = findDateInText(el);
+        if (fromText) return fromText;
+
+        const logEl = getChatLog();
+        if (!logEl) return null;
+        const er = el.getBoundingClientRect();
+        let best = null, bestTop = -Infinity;
+
+        for (const c of logEl.querySelectorAll('span, div, h4, time')) {
+            if (c.children.length > 3) continue;
+            const text = (c.innerText || '').replace(/\s+/g, ' ').trim();
+            if (!text || text.length > 40 || !isSystemHeader(text)) continue;
+
+            const inside = el.contains(c);
+            if (!inside && c.contains(el)) continue;
+            const r = c.getBoundingClientRect();
+            if (!r.height) continue;
+            if (!(inside ? r.top <= er.top + 40 : r.top <= er.top + 4)) continue;
+
+            const d = parseSeparatorDate(text);
+            if (d && r.top > bestTop) { bestTop = r.top; best = d; }
+        }
+        return best ? formatDate(best) : null;
+    }
+
+    function cleanName(t) {
+        return (t || '').split('\n')[0].replace(/^conversation titled\s+/i, '').trim();
+    }
+
+    const groupConvs = new Set(); // chats where sender names are shown (group chats)
+
+    function nameOk(n) {
+        return !!n && n.length <= 30 && !/titled/i.test(n) && !/^(enter\b|message (sent|received))/i.test(n) && !isSystemHeader(n);
+    }
+
+    function listRawRows() {
+        const logEl = getChatLog();
+        if (!logEl) return [];
+        let rows = [...logEl.querySelectorAll('[role="row"]')];
+        if (!rows.length) rows = [...logEl.querySelectorAll('[role="gridcell"], [data-testid="mw_message_row"], div[data-scope="message"]')];
+        if (!rows.length) rows = [...logEl.querySelectorAll('div[tabindex="-1"]')];
+        rows = rows.filter(r => !rows.some(o => o !== r && r.contains(o)));
+        rows.sort((x, y) => x.getBoundingClientRect().top - y.getBoundingClientRect().top);
+        return rows;
+    }
+
+    // Small round profile picture (shown next to the last message of a sender)
+    function hasAvatar(row) {
+        return [...row.querySelectorAll('img')].some(i => {
+            const r = i.getBoundingClientRect();
+            return r.width >= 18 && r.width <= 40 && r.height >= 18 && r.height <= 40;
+        });
+    }
+
+    // Sender name written above a message (shown in group chats)
+    function nameLabelIn(row) {
+        for (const h of row.querySelectorAll('h4, [role="heading"]')) {
+            const n = cleanName(h.innerText);
+            if (nameOk(n)) return n;
+        }
+        // small text sitting above bigger message text
+        const lines = [];
+        const range = document.createRange();
+        const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+        let node;
+        while ((node = walker.nextNode())) {
+            const t = (node.nodeValue || '').trim();
+            if (!t || isSystemHeader(t) || !node.parentElement) continue;
+            range.selectNodeContents(node);
+            const r = range.getBoundingClientRect();
+            if (r.width < 2) continue;
+            lines.push({ text: t, top: r.top, size: parseFloat(getComputedStyle(node.parentElement).fontSize) || 0 });
+        }
+        lines.sort((x, y) => x.top - y.top);
+        if (lines.length >= 2 && lines[0].size > 0 && lines[0].size < lines[1].size - 0.5 && nameOk(lines[0].text)) {
+            return lines[0].text;
+        }
+        return null;
+    }
+
+    // Sender name from the profile picture's label
+    function avatarNameIn(row) {
+        for (const i of row.querySelectorAll('img')) {
+            const r = i.getBoundingClientRect();
+            if (r.width < 18 || r.width > 40) continue;
+            const raw = i.getAttribute('alt') || i.getAttribute('aria-label') || '';
+            const n = cleanName(raw).replace(/['\u2019]s\s+(profile\s+)?(picture|photo|avatar)$/i, '').trim();
+            if (nameOk(n)) return n;
+        }
+        return null;
+    }
+
+    function getChatTitle() {
+        const heads = document.querySelectorAll('[role="main"] h1, [role="main"] h2, [role="main"] [role="heading"]');
+        for (const hd of heads) {
+            const r = hd.getBoundingClientRect();
+            if (r.top > 110 || r.left < 250) continue;
+            const n = cleanName(hd.innerText || hd.getAttribute('aria-label'));
+            if (n && n.length < 40) return n;
+        }
+        return 'Them';
+    }
+
+    let lastGroupScan = 0;
+    function isGroupChat() {
+        const conv = getConvId();
+        if (groupConvs.has(conv)) return true;
+        if (Date.now() - lastGroupScan < 3000) return false;
+        lastGroupScan = Date.now();
+
+        const title = getChatTitle();
+        for (const r of listRawRows()) {
+            if (bubbleSide(r) === 'sent') continue;
+            const n = nameLabelIn(r) || avatarNameIn(r);
+            if (n && n !== title) { groupConvs.add(conv); return true; }
+        }
+        return false;
+    }
+
+    // Name of the person who SENT this message (not the group name)
+    function getOtherName(el) {
+        const conv = getConvId();
+
+        const label = nameLabelIn(el);
+        if (label) { groupConvs.add(conv); return label; }
+        const own = avatarNameIn(el);
+        if (own) {
+            if (own !== getChatTitle()) groupConvs.add(conv); // picture name differs from chat name = group
+            return own;
+        }
+
+        const rows = listRawRows();
+        const idx = rows.indexOf(el);
+        if (idx >= 0) {
+            // go up through the same sender's messages to find the name above them
+            for (let i = idx - 1; i >= Math.max(0, idx - 15); i--) {
+                const r = rows[i];
+                const t = (r.innerText || '').trim();
+                if (isSystemHeader(t) || bubbleSide(r) === 'sent' || hasAvatar(r)) break;
+                const l = nameLabelIn(r);
+                if (l) { groupConvs.add(conv); return l; }
+            }
+            // or go down to the sender's profile picture
+            for (let i = idx + 1; i < Math.min(rows.length, idx + 15); i++) {
+                const r = rows[i];
+                const t = (r.innerText || '').trim();
+                if (isSystemHeader(t) || bubbleSide(r) === 'sent') break;
+                if (nameLabelIn(r)) break; // next sender starts here
+                const a = avatarNameIn(r);
+                if (a) return a;
+            }
+        }
+        // 1-to-1 chat: the chat title is the other person. Group chat: never use the group name.
+        return isGroupChat() ? 'Them' : getChatTitle();
+    }
+
+    // Shows:  "You: 12/06/2025"  /  "Alice: 11/20/2025"
+    // Unsent notices: "You unsent a message · 12/06/2025"
+    function getPreview(el) {
+        const type = classifyMessage(el);
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').replace(/^enter,?\s*/i, '').trim();
+        const date = findMessageDate(el);
+
+        if (type === 'tombstone') {
+            const m = text.match(/^(.+?)\s+(unsent|removed|deleted)\s+(.+)$/i);
+            let who = m ? m[1] : (bubbleSide(el) === 'sent' ? 'You' : getOtherName(el));
+            if (/^you$/i.test(who)) who = 'You';
+            const verb = m ? m[2].toLowerCase() : 'unsent';
+            const what = m ? m[3] : 'a message';
+            const line = (who + ' ' + verb + ' ' + what).slice(0, 34);
+            return date ? line + ' \u00b7 ' + date : line;
+        }
+
+        const name = type === 'sent' ? 'You' : getOtherName(el);
+        return name + ': ' + (date || 'date unknown');
+    }
+
+    // All message rows currently on the page (no screen-edge filter)
+    function getMessageRows() {
+        const logEl = getChatLog();
+        if (!logEl) return [];
+
+        let rows = [...logEl.querySelectorAll('[role="row"]')];
+        if (!rows.length) rows = [...logEl.querySelectorAll('[role="gridcell"], [data-testid="mw_message_row"], div[data-scope="message"]')];
+        if (!rows.length) rows = [...logEl.querySelectorAll('div[tabindex="-1"]')];
+
+        // drop rows that contain other rows
+        rows = rows.filter(r => !rows.some(o => o !== r && r.contains(o)));
+
+        const valid = [];
+        for (const row of rows) {
+            if (!row.isConnected) continue;
+            const r = row.getBoundingClientRect();
+            if (r.width < 15 || r.height < 15) continue;
+
+            const text = (row.innerText || row.textContent || '').trim();
+            const isTomb = isTombstoneText(text);
+            const hasMedia = row.querySelector('img, svg:not([aria-hidden="true"]), video, audio, [role="img"]');
+
+            if (/conversation titled/i.test(text)) continue; // chat intro card
+
+            if (!isTomb) {
+                if (!text && !hasMedia) continue;
+                if (text && isSystemHeader(text)) continue;
+            }
+            valid.push(row);
+        }
+        valid.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+        return valid;
+    }
+
+    // Bottom-most message we haven't handled yet
+    function pickNext() {
+        const rows = getMessageRows();
+        for (let i = rows.length - 1; i >= 0; i--) {
+            if (doneMap.get(rows[i]) !== signature(rows[i])) return rows[i];
+        }
+        return null;
+    }
+
+    // =========================================================================
+    // INTERACTION HELPERS
+    // =========================================================================
+    function hoverAt(el, x, y) {
+        if (!el || !el.isConnected) return;
+        const rect = el.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+        const cx = x !== undefined ? x : rect.left + rect.width / 2;
+        const cy = y !== undefined ? y : rect.top + rect.height / 2;
+        const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, screenX: cx, screenY: cy };
+        let node = el;
+        for (let d = 0; d < 7 && node && node !== document.body; d++) {
+            ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove'].forEach(ev => {
+                try { node.dispatchEvent(new MouseEvent(ev, opts)); } catch (_) {}
+            });
+            node = node.parentElement;
+        }
+    }
+
+    async function safeClick(el) {
+        if (!el || !el.isConnected) return false;
+        await sleep(CONFIG.CLICK_WAIT);
+        try {
+            el.click();
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function pressEscape() {
+        const targets = [document.activeElement, document, document.body].filter(Boolean);
+        targets.forEach(t => {
+            try { t.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true })); } catch (_) {}
+        });
+    }
+
+    async function waitFor(selector, timeout, root) {
+        const end = Date.now() + (timeout || 1000);
+        root = root || document;
+        while (Date.now() < end && running && !stopped) {
+            const el = root.querySelector(selector);
+            if (el) return el;
+            await sleep(25);
+        }
+        return null;
+    }
+
+    async function waitGone(selector, timeout) {
+        const end = Date.now() + (timeout || 1000);
+        while (Date.now() < end) {
+            if (!document.querySelector(selector)) return true;
+            await sleep(30);
+        }
+        return false;
+    }
+
+    // =========================================================================
+    // FIND THE 3-DOTS BUTTON AND MENU
+    // =========================================================================
+    function is3DotsButton(btn) {
+        if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
+        const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+
+        if (/chat|conversation|group|react|reply|forward|send|voice|sticker|gif|attach|like/.test(label)) return false;
+
+        if (/^(more|more actions|more options|action options|message actions|options|see more)$/i.test(label) ||
+            label.includes('more actions') || label.includes('more options')) return true;
+
+        const popup = btn.getAttribute('aria-haspopup');
+        if (popup === 'menu' || popup === 'true') return true;
+
+        return btn.querySelectorAll('circle').length === 3;
+    }
+
+    function find3DotsButton(el) {
+        const elRect = el.getBoundingClientRect();
+
+        let node = el;
+        for (let d = 0; d < 8 && node && node !== document.body; d++) {
+            for (const b of node.querySelectorAll('[role="button"], button')) {
+                if (is3DotsButton(b)) return b;
+            }
+            node = node.parentElement;
+        }
+
+        node = el.parentElement;
+        for (let d = 0; d < 5 && node && node !== document.body; d++) {
+            for (const sib of [node.previousElementSibling, node.nextElementSibling]) {
+                if (!sib) continue;
+                for (const b of sib.querySelectorAll('[role="button"], button')) {
+                    if (is3DotsButton(b)) return b;
+                }
+            }
+            node = node.parentElement;
+        }
+
+        const all = document.querySelectorAll('[aria-haspopup="menu"], [aria-label*="More" i], [aria-label*="actions" i], [role="button"]');
+        for (const b of all) {
+            if (!is3DotsButton(b)) continue;
+            const r = b.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0 && r.left >= 240 &&
+                Math.abs((r.top + r.height / 2) - (elRect.top + elRect.height / 2)) < 80) return b;
+        }
+        return null;
+    }
+
+    async function openMenuFor(el) {
+        if (!el || !el.isConnected) return null;
+
+        // Bring the message to the middle of the screen (fixes top/bottom edge problems)
+        try { el.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (_) {}
+        await sleep(80);
+
+        const target = el.querySelector('img, [dir="auto"], [role="button"]') || el;
+        const rect = target.getBoundingClientRect();
+        const type = classifyMessage(el);
+
+        hoverAt(target, rect.left + rect.width / 2, rect.top + rect.height / 2);
+        hoverAt(el);
+        await sleep(CONFIG.HOVER_WAIT);
+
+        let moreBtn = find3DotsButton(el);
+        if (moreBtn) {
+            await safeClick(moreBtn);
+            const m = await waitFor('[role="menu"]', CONFIG.MENU_WAIT);
+            if (m) return m;
+        }
+
+        const sideX = type === 'sent' ? Math.max(10, rect.left - 35) : rect.right + 35;
+        hoverAt(el, sideX, rect.top + rect.height / 2);
+        await sleep(CONFIG.HOVER_WAIT);
+
+        moreBtn = find3DotsButton(el);
+        if (moreBtn) {
+            await safeClick(moreBtn);
+            const m = await waitFor('[role="menu"]', CONFIG.MENU_WAIT);
+            if (m) return m;
+        }
+
+        // Last try: right-click menu
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const o = { bubbles: true, cancelable: true, view: window, button: 2, buttons: 2, clientX: cx, clientY: cy };
+        target.dispatchEvent(new MouseEvent('mousedown', o));
+        target.dispatchEvent(new MouseEvent('contextmenu', o));
+        target.dispatchEvent(new MouseEvent('mouseup', o));
+        return await waitFor('[role="menu"]', CONFIG.MENU_WAIT);
+    }
+
+    // =========================================================================
+    // SAFETY: NEVER DELETE CHATS OR LEAVE GROUPS
+    // =========================================================================
+    const BAD_MENU_WORDS = /\b(chat|conversation|group|leave|archive|block|mute|report|member|react|pin|reply|forward)\b/;
+
+    // returns { item, kind } where kind is 'unsend' or 'remove'
+    function findMenuAction(menu, preferred) {
+        if (!menu) return null;
+
+        let list = [...menu.querySelectorAll('[role="menuitem"]')];
+        if (!list.length) list = [...menu.querySelectorAll('[role="button"], div[tabindex="0"]')];
+
+        let unsend = null, remove = null;
+        for (const item of list) {
+            const full = ((item.innerText || item.textContent || '') + ' ' + (item.getAttribute('aria-label') || '')).trim().toLowerCase();
+            if (!full || BAD_MENU_WORDS.test(full)) continue;
+
+            if (full.includes('unsend')) {
+                if (!unsend) unsend = item;
+            } else if (/\b(remove|delete)\b/.test(full)) {
+                if (!remove) remove = item;
+            }
+        }
+
+        if (preferred === 'unsend') {
+            if (unsend) return { item: unsend, kind: 'unsend' };
+            if (remove) return { item: remove, kind: 'remove' };
+            return null;
+        }
+        return remove ? { item: remove, kind: 'remove' } : null;
+    }
+
+    async function handleConfirmDialog(requireEveryone) {
+        const dialog = await waitFor('[role="dialog"]', CONFIG.DIALOG_WAIT);
+        if (!dialog) return true;
+
+        const dialogText = (dialog.innerText || dialog.textContent || '').toLowerCase();
+        if (dialogText.includes('delete chat') || dialogText.includes('delete conversation') ||
+            dialogText.includes('leave group') || dialogText.includes('leave this group') ||
+            dialogText.includes('delete this chat') || dialogText.includes('archive')) {
+            log('Dialog looked like delete chat / leave group. Cancelled.');
+            pressEscape();
+            return false;
+        }
+
+        if (requireEveryone) {
+            const radios = [...dialog.querySelectorAll('[role="radio"], input[type="radio"]')];
+            if (radios.length) {
+                const everyone = radios.find(r => {
+                    const txt = ((r.getAttribute('aria-label') || '') + ' ' + (r.closest('label, div') || r).textContent).toLowerCase();
+                    return txt.includes('everyone');
+                }) || radios[0];
+                const checked = everyone.checked || everyone.getAttribute('aria-checked') === 'true';
+                if (!checked) {
+                    everyone.click();
+                    await sleep(80);
+                }
+            }
+        }
+
+        const buttons = [...dialog.querySelectorAll('button, [role="button"]')].filter(b => {
+            if (b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
+            const txt = (b.innerText || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
+            if (txt === 'cancel' || txt.includes('keep') || txt.includes('close')) return false;
+            if (txt.includes('leave') || txt.includes('delete chat')) return false;
+            return txt.includes('unsend') || txt.includes('remove') || txt.includes('delete') || txt === 'ok' || txt === 'confirm';
+        });
+
+        const confirmBtn = buttons[0];
+        if (!confirmBtn || !(await safeClick(confirmBtn))) {
+            pressEscape();
+            return false;
+        }
+        await waitGone('[role="dialog"]', 1500);
+        return true;
+    }
+
+    // =========================================================================
+    // PROCESS ONE MESSAGE
+    // =========================================================================
+    let debugLogs = 0;
+    async function processMessage(el) {
+        if (!el || !el.isConnected) return 'skip';
+
+        const type = classifyMessage(el);
+        if (type === 'sent' && !settings.unsendYours) return 'skip';
+        if (type === 'tombstone' && !settings.deleteTombstones) return 'skip';
+        if (type === 'received' && !settings.deleteOthers) return 'skip';
+
+        if (debugLogs < 12) {
+            debugLogs++;
+            log('Row', type, JSON.stringify((el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 100)));
+        }
+        const workDate = findMessageDate(el);
+        updatePanel('Working...', 'busy', 'Unsending' + (workDate ? ' \u00b7 ' + workDate : ''));
+
+        // close any menu left open
+        if (document.querySelector('[role="menu"]')) {
+            pressEscape();
+            await sleep(80);
+        }
+
+        const menu = await openMenuFor(el);
+        if (!menu) { pressEscape(); return 'retry'; }
+
+        const action = findMenuAction(menu, type === 'sent' ? 'unsend' : 'remove');
+        if (!action) { pressEscape(); return 'skip'; }
+
+        if (!(await safeClick(action.item))) { pressEscape(); return 'retry'; }
+
+        const ok = await handleConfirmDialog(action.kind === 'unsend');
+        if (!ok) { pressEscape(); return 'retry'; }
+
+        if (action.kind === 'unsend') stats.yoursUnsent++;
+        else if (type === 'tombstone') stats.tombstonesDeleted++;
+        else stats.othersDeleted++;
+        stats.totalCleaned++;
+
+        await sleep(CONFIG.POST_DELETE_WAIT);
+        // An unsent message turns into an "unsent" notice. The main loop
+        // picks it up next and removes it (if that option is on).
+        return 'success';
+    }
+
+    // =========================================================================
+    // SCROLLING UP
+    // =========================================================================
+    // Returns 'more' (keep going) or 'finished'
+    async function goUp() {
+        const sc = getScroller();
+        if (!sc) return 'finished';
+
+        const startTop = sc.scrollTop;
+        const wasAtTop = startTop <= 5;
+
+        if (!wasAtTop) {
+            sc.scrollTop = Math.max(0, startTop - sc.clientHeight * 0.8);
+        } else {
+            sc.scrollTop = 20;
+            await sleep(60);
+            sc.scrollTop = 0;
+        }
+        try {
+            sc.dispatchEvent(new Event('scroll', { bubbles: true }));
+            sc.dispatchEvent(new WheelEvent('wheel', { deltaY: -3000, bubbles: true }));
+        } catch (_) {}
+
+        const maxWait = wasAtTop ? CONFIG.SCROLL_WAIT : 600;
+        const end = Date.now() + maxWait;
+        while (Date.now() < end && running && !stopped) {
+            if (pickNext()) { emptyTop = 0; return 'more'; }
+            await sleep(100);
+        }
+
+        if (pickNext()) { emptyTop = 0; return 'more'; }
+        if (!wasAtTop && sc.scrollTop < startTop - 1) return 'more'; // still moving up
+
+        emptyTop++;
+        return emptyTop >= CONFIG.MAX_EMPTY_SCROLLS ? 'finished' : 'more';
+    }
+
+    // =========================================================================
+    // UI
+    // =========================================================================
+    let gPlusBtn = null, tooltip = null, card = null;
+    let themePillBtns = {}, toggleSwitches = {};
+    let uiStatus = null, uiPreview = null;
+    let mainBtn = null, pauseBtn = null;
+    let isPinned = false, hoverTimeout = null;
+
+    function isDarkEffective() {
+        if (settings.themeMode === 'dark') return true;
+        if (settings.themeMode === 'light') return false;
+        return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    }
+
+    // Finds the most colorful color used inside an icon button
+    function readIconColor(btn) {
+        if (!btn) return null;
+        const parse = v => {
+            const m = v && v.match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+))?/i);
+            if (!m) return null;
+            if (m[4] !== undefined && parseFloat(m[4]) === 0) return null;
+            const r = +m[1], g = +m[2], b = +m[3];
+            return { css: v, sat: Math.max(r, g, b) - Math.min(r, g, b) };
+        };
+        const found = [];
+        const add = v => { const p = parse(v); if (p) found.push(p); };
+        const addGradient = v => {
+            const m = v && v.match(/url\(["']?#([^"')]+)["']?\)/);
+            if (!m) return;
+            const g = document.getElementById(m[1]);
+            if (!g) return;
+            g.querySelectorAll('stop').forEach(st => add(getComputedStyle(st).stopColor));
+        };
+
+        const nodes = [...btn.querySelectorAll('*')];
+        // 1) SVG fill / stroke / gradients
+        for (const n of nodes) {
+            if (!(n instanceof SVGElement)) continue;
+            const cs = getComputedStyle(n);
+            add(cs.fill); add(cs.stroke);
+            addGradient(cs.fill); addGradient(cs.stroke);
+        }
+        // 2) icon images drawn with a background color (<i>)
+        for (const n of nodes) {
+            if (n.tagName === 'I') add(getComputedStyle(n).backgroundColor);
+        }
+        // 3) text color of the button
+        add(getComputedStyle(btn).color);
+
+        if (!found.length) return null;
+        found.sort((x, y) => y.sat - x.sat);
+        return found[0];
+    }
+
+    // Color of the "Conversation information" icon (falls back to the call icons)
+    function getInfoIconColor() {
+        const selectors = [
+            '[aria-label*="Conversation information" i], [aria-label*="Conversation info" i], [aria-label*="Chat info" i]',
+            '[aria-label*="video call" i]',
+            '[aria-label*="voice call" i]'
+        ];
+        let best = null;
+        for (const sel of selectors) {
+            const btn = [...document.querySelectorAll(sel)].find(b => {
+                const r = b.getBoundingClientRect();
+                return r.top < 120 && r.width > 0;
+            });
+            const c = readIconColor(btn);
+            if (c && c.sat >= 40) return c.css;
+            if (c && !best) best = c;
+        }
+        return best ? best.css : null;
+    }
+
+    function syncGPlusColor() {
+        if (!gPlusBtn) return;
+        const c = getInfoIconColor();
+        gPlusBtn.style.color = c || (isDarkEffective() ? '#c084fc' : '#9333ea');
+    }
+
+    function applyTheme() {
+        const isDark = isDarkEffective();
+        localStorage.setItem('__gplus_theme', settings.themeMode);
+
+        ['auto', 'light', 'dark'].forEach(key => {
+            const btn = themePillBtns[key];
+            if (!btn) return;
+            if (settings.themeMode === key) {
+                btn.style.background = isDark ? '#ffffff' : '#000000';
+                btn.style.color = isDark ? '#000000' : '#ffffff';
+                btn.style.fontWeight = '700';
+            } else {
+                btn.style.background = 'transparent';
+                btn.style.color = isDark ? '#a3a3a3' : '#6b7280';
+                btn.style.fontWeight = '500';
+            }
+        });
+
+        if (card) {
+            card.style.background = isDark ? '#262626' : '#ffffff';
+            card.style.color = isDark ? '#f5f5f5' : '#111827';
+            card.style.borderColor = isDark ? '#383838' : '#e5e7eb';
+            card.style.boxShadow = isDark ? '0 16px 40px rgba(0,0,0,0.65)' : '0 12px 36px rgba(0,0,0,0.12)';
+        }
+
+        const themeBox = document.getElementById('__gplus_theme_box');
+        if (themeBox) themeBox.style.borderColor = isDark ? '#404040' : '#e5e7eb';
+
+        if (mainBtn && !running) {
+            mainBtn.style.background = isDark ? '#2e2e2e' : '#ffffff';
+            mainBtn.style.borderColor = isDark ? '#454545' : '#d1d5db';
+            mainBtn.style.color = isDark ? '#ffffff' : '#111827';
+        }
+        if (pauseBtn && !paused) {
+            pauseBtn.style.background = isDark ? '#2e2e2e' : '#ffffff';
+            pauseBtn.style.borderColor = isDark ? '#454545' : '#d1d5db';
+            pauseBtn.style.color = isDark ? '#ffffff' : '#111827';
+        }
+
+        syncGPlusColor();
+        Object.keys(toggleSwitches).forEach(updateToggleVisual);
+    }
+
+    function createSwitch(key, initialVal, onToggle) {
+        const wrap = document.createElement('div');
+        Object.assign(wrap.style, {
+            width: '42px', height: '24px', borderRadius: '12px', cursor: 'pointer',
+            position: 'relative', transition: 'background 0.22s ease', flexShrink: '0'
+        });
+        const knob = document.createElement('div');
+        Object.assign(knob.style, {
+            width: '20px', height: '20px', borderRadius: '50%', position: 'absolute',
+            top: '2px', left: '2px', transition: 'transform 0.22s ease, background 0.22s ease',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.25)'
+        });
+        wrap.appendChild(knob);
+        wrap.setAttribute('data-gplus-switch', '1');
+        toggleSwitches[key] = { wrap, knob, checked: initialVal };
+
+        wrap.onclick = e => {
+            e.stopPropagation();
+            toggleSwitches[key].checked = !toggleSwitches[key].checked;
+            updateToggleVisual(key);
+            onToggle(toggleSwitches[key].checked);
+        };
+        return wrap;
+    }
+
+    function updateToggleVisual(key) {
+        const item = toggleSwitches[key];
+        if (!item) return;
+        const isDark = isDarkEffective();
+        if (item.checked) {
+            item.wrap.style.background = isDark ? '#ffffff' : '#000000';
+            item.knob.style.background = isDark ? '#000000' : '#ffffff';
+            item.knob.style.transform = 'translateX(18px)';
+        } else {
+            item.wrap.style.background = isDark ? '#525252' : '#d1d5db';
+            item.knob.style.background = '#ffffff';
+            item.knob.style.transform = 'translateX(0)';
+        }
+    }
+
+    function findHeaderToolbar() {
+        const candidates = [
+            ...document.querySelectorAll('[aria-label*="call" i]'),
+            ...document.querySelectorAll('[aria-label*="audio" i]'),
+            ...document.querySelectorAll('[aria-label*="voice" i]'),
+            ...document.querySelectorAll('[aria-label*="video" i]'),
+            ...document.querySelectorAll('[aria-label*="Conversation information" i]'),
+            ...document.querySelectorAll('[aria-label*="Chat info" i]')
+        ];
+        for (const btn of candidates) {
+            const r = btn.getBoundingClientRect();
+            if (r.top < 85 && r.left > 280 && r.width >= 20 && r.height >= 20) {
+                let p = btn.parentElement;
+                while (p && p !== document.body) {
+                    const style = getComputedStyle(p);
+                    const isRow = (style.display === 'flex' || style.display === 'inline-flex') &&
+                                  !style.flexDirection.includes('column');
+                    if (isRow && p.children.length >= 2) return { toolbar: p, firstItem: p.firstElementChild };
+                    p = p.parentElement;
+                }
+                const b = btn.closest('[role="button"]') || btn;
+                return { toolbar: b.parentElement, firstItem: b };
+            }
+        }
+        return null;
+    }
+
+    function updateCardPosition() {
+        if (!gPlusBtn || !card) return;
+        const r = gPlusBtn.getBoundingClientRect();
+        card.style.position = 'fixed';
+        card.style.top = Math.max(50, r.bottom + 8) + 'px';
+        card.style.right = Math.max(16, window.innerWidth - r.right - 10) + 'px';
+        card.style.left = 'auto';
+    }
+
+    function showCard(show) {
+        if (!card) return;
+        if (show) {
+            updateCardPosition();
+            card.style.display = 'flex';
+            requestAnimationFrame(() => {
+                card.style.opacity = '1';
+                card.style.transform = 'translateY(0)';
+            });
+        } else {
+            card.style.opacity = '0';
+            card.style.transform = 'translateY(8px)';
+            setTimeout(() => {
+                if (card.style.opacity === '0') card.style.display = 'none';
+            }, 180);
+        }
+    }
+
+    function buildUI() {
+        if (document.getElementById('__gplus_header_btn')) return;
+
+        gPlusBtn = document.createElement('div');
+        gPlusBtn.id = '__gplus_header_btn';
+        gPlusBtn.innerHTML = '<span style="display:inline-block;line-height:1;">G+</span>';
+        Object.assign(gPlusBtn.style, {
+            width: '36px', height: '36px', minWidth: '36px', minHeight: '36px',
+            borderRadius: '50%', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: '21px', fontWeight: '700', letterSpacing: '-0.6px', lineHeight: '1',
+            cursor: 'pointer', marginRight: '6px', position: 'relative', zIndex: '9999',
+            transition: 'background 0.15s ease', color: '#9333ea', background: 'transparent'
+        });
+
+        tooltip = document.createElement('div');
+        tooltip.textContent = 'G+ Unsender';
+        Object.assign(tooltip.style, {
+            position: 'absolute', top: '42px', left: '50%', transform: 'translateX(-50%)',
+            background: '#282828', color: '#ffffff', fontSize: '12px', fontWeight: '500',
+            padding: '5px 10px', borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            whiteSpace: 'nowrap', pointerEvents: 'none', zIndex: '2147483647',
+            display: 'none', opacity: '0', transition: 'opacity 0.15s ease', letterSpacing: '0'
+        });
+        gPlusBtn.appendChild(tooltip);
+
+        gPlusBtn.onmouseenter = () => {
+            gPlusBtn.style.background = isDarkEffective() ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.06)';
+            tooltip.style.display = 'block';
+            requestAnimationFrame(() => tooltip.style.opacity = '1');
+            if (hoverTimeout) clearTimeout(hoverTimeout);
+            hoverTimeout = setTimeout(() => showCard(true), 250);
+        };
+        gPlusBtn.onmouseleave = () => {
+            gPlusBtn.style.background = 'transparent';
+            tooltip.style.opacity = '0';
+            setTimeout(() => { tooltip.style.display = 'none'; }, 150);
+            if (running || isPinned) return;
+            hoverTimeout = setTimeout(() => showCard(false), 350);
+        };
+        gPlusBtn.onclick = e => {
+            e.stopPropagation();
+            isPinned = !isPinned;
+            showCard(true);
+        };
+
+        card = document.createElement('div');
+        card.id = '__gplus_card';
+        Object.assign(card.style, {
+            display: 'none', width: '270px', borderRadius: '18px', border: '1px solid #e5e7eb',
+            padding: '16px 18px', flexDirection: 'column', gap: '12px', zIndex: '2147483647',
+            opacity: '0', transform: 'translateY(8px)', transition: 'opacity 0.18s ease, transform 0.18s ease',
+            fontFamily: 'inherit'
+        });
+        card.onmouseenter = () => { if (hoverTimeout) clearTimeout(hoverTimeout); };
+        card.onmouseleave = () => {
+            if (running || isPinned) return;
+            hoverTimeout = setTimeout(() => showCard(false), 300);
+        };
+
+        // Header
+        const header = document.createElement('div');
+        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding-bottom:2px;';
+        const title = document.createElement('div');
+        title.innerHTML = '<b>G+ Unsender</b>';
+        title.style.fontSize = '14px';
+        const hideBtn = document.createElement('button');
+        hideBtn.title = 'Close';
+        hideBtn.setAttribute('aria-label', 'Close');
+        hideBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round"><path d="M2 2l8 8M10 2l-8 8"/></svg>';
+        hideBtn.style.cssText = 'width:22px;height:22px;border-radius:50%;background:#ef4444;border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0;flex-shrink:0;';
+        hideBtn.onclick = () => { showCard(false); isPinned = false; };
+        header.appendChild(title);
+        header.appendChild(hideBtn);
+        card.appendChild(header);
+
+        // Theme
+        const secTheme = document.createElement('div');
+        secTheme.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
+        const lblTheme = document.createElement('div');
+        lblTheme.textContent = 'Theme';
+        lblTheme.style.cssText = 'font-size:11px;font-weight:700;color:#888888;';
+        secTheme.appendChild(lblTheme);
+
+        const themeBox = document.createElement('div');
+        themeBox.id = '__gplus_theme_box';
+        themeBox.style.cssText = 'display:flex;border:1px solid #e5e7eb;border-radius:10px;padding:2px;gap:2px;';
+        ['auto', 'light', 'dark'].forEach(key => {
+            const btn = document.createElement('button');
+            btn.textContent = key.charAt(0).toUpperCase() + key.slice(1);
+            btn.style.cssText = 'flex:1;padding:5px 0;font-size:11px;border-radius:8px;border:none;cursor:pointer;transition:all 0.15s ease;';
+            btn.onclick = () => { settings.themeMode = key; applyTheme(); };
+            themePillBtns[key] = btn;
+            themeBox.appendChild(btn);
+        });
+        secTheme.appendChild(themeBox);
+        card.appendChild(secTheme);
+
+        // Options
+        const secOptions = document.createElement('div');
+        secOptions.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
+        const lblOptions = document.createElement('div');
+        lblOptions.textContent = 'Options';
+        lblOptions.style.cssText = 'font-size:11px;font-weight:700;color:#888888;';
+        secOptions.appendChild(lblOptions);
+
+        const mkRow = (labelText, key, val, onChange) => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:5px 0;font-size:12px;';
+            const txt = document.createElement('span');
+            txt.textContent = labelText;
+            row.appendChild(txt);
+            row.appendChild(createSwitch(key, val, onChange));
+            return row;
+        };
+        secOptions.appendChild(mkRow('Unsend my messages', 'unsendYours', settings.unsendYours, v => settings.unsendYours = v));
+        secOptions.appendChild(mkRow('Remove unsent notices', 'deleteTombstones', settings.deleteTombstones, v => settings.deleteTombstones = v));
+        secOptions.appendChild(mkRow('Remove their messages', 'deleteOthers', settings.deleteOthers, v => settings.deleteOthers = v));
+        card.appendChild(secOptions);
+
+        // Status
+        const secStats = document.createElement('div');
+        secStats.style.cssText = 'display:flex;flex-direction:column;gap:4px;border-top:1px solid rgba(148,163,184,0.15);padding-top:8px;';
+        const statHeader = document.createElement('div');
+        statHeader.style.cssText = 'display:flex;justify-content:space-between;align-items:center;font-size:12px;';
+
+        uiStatus = document.createElement('div');
+        uiStatus.textContent = 'Ready';
+        uiStatus.style.cssText = 'font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;';
+
+        const countBadge = document.createElement('div');
+        countBadge.id = '__gplus_count_badge';
+        countBadge.textContent = 'Done: 0';
+        countBadge.style.cssText = 'font-size:11px;font-weight:700;opacity:0.75;';
+
+        statHeader.appendChild(uiStatus);
+        statHeader.appendChild(countBadge);
+        secStats.appendChild(statHeader);
+
+        uiPreview = document.createElement('div');
+        uiPreview.textContent = 'Nothing yet';
+        uiPreview.style.cssText = 'font-size:11px;opacity:0.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+        secStats.appendChild(uiPreview);
+        card.appendChild(secStats);
+
+        // Buttons
+        const btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;gap:8px;margin-top:2px;';
+        const btnStyle = {
+            flex: '1', padding: '8px 0', borderRadius: '9px', fontSize: '12px',
+            fontWeight: '600', cursor: 'pointer', transition: 'all 0.15s ease',
+            border: '1px solid #d1d5db', background: '#ffffff'
+        };
+
+        mainBtn = document.createElement('button');
+        mainBtn.textContent = 'Start';
+        Object.assign(mainBtn.style, btnStyle);
+        mainBtn.onclick = () => (running ? stopRun('Stopped', 'warn') : startRun());
+
+        pauseBtn = document.createElement('button');
+        pauseBtn.textContent = 'Pause';
+        Object.assign(pauseBtn.style, btnStyle);
+        pauseBtn.onclick = togglePause;
+
+        btnRow.appendChild(mainBtn);
+        btnRow.appendChild(pauseBtn);
+        card.appendChild(btnRow);
+
+        // Hover effect: buttons and switches go to 80% opacity
+        const hoverStyle = document.createElement('style');
+        hoverStyle.textContent =
+            '#__gplus_card button, #__gplus_card [data-gplus-switch] { transition: opacity 0.15s ease, background 0.15s ease, transform 0.22s ease; }' +
+            '#__gplus_card button:hover, #__gplus_card [data-gplus-switch]:hover { opacity: 0.8; }' +
+            '#__gplus_card [data-gplus-strong]:hover { opacity: 0.5; }';
+        [mainBtn, pauseBtn, hideBtn].forEach(b => b && b.setAttribute('data-gplus-strong', '1'));
+        document.head.appendChild(hoverStyle);
+
+        document.body.appendChild(card);
+        mountHeaderButton();
+        applyTheme();
+    }
+
+    function mountHeaderButton() {
+        if (!gPlusBtn) return;
+        const target = findHeaderToolbar();
+        if (target && target.toolbar) {
+            if (gPlusBtn.parentElement !== target.toolbar) {
+                target.toolbar.insertBefore(gPlusBtn, target.firstItem);
+                gPlusBtn.style.position = 'relative';
+                gPlusBtn.style.top = 'auto';
+                gPlusBtn.style.right = 'auto';
+                gPlusBtn.style.left = 'auto';
+            }
+        } else if (!gPlusBtn.isConnected) {
+            const callBtn = document.querySelector('[aria-label*="call" i], [aria-label*="voice" i]');
+            if (callBtn) {
+                const r = callBtn.getBoundingClientRect();
+                Object.assign(gPlusBtn.style, { position: 'fixed', top: r.top + 'px', left: (r.left - 42) + 'px', right: 'auto' });
+            } else {
+                Object.assign(gPlusBtn.style, { position: 'fixed', top: '14px', right: '120px', left: 'auto' });
+            }
+            document.body.appendChild(gPlusBtn);
+        }
+        syncGPlusColor();
+    }
+
+    function updatePanel(statusText, type, previewText) {
+        const badge = document.getElementById('__gplus_count_badge');
+        if (badge) badge.textContent = `Done: ${stats.totalCleaned}`;
+        if (statusText && uiStatus) {
+            uiStatus.textContent = statusText;
+            uiStatus.style.color = type === 'error' ? '#ef4444' : type === 'success' ? '#10b981' : type === 'warn' ? '#f59e0b' : 'inherit';
+        }
+        if (previewText && uiPreview) uiPreview.textContent = previewText;
+    }
+
+    function startRun() {
+        if (!getChatLog()) {
+            updatePanel('Open a chat first', 'error');
+            return;
+        }
+        lockedConvId = getConvId();
+        running = true;
+        paused = false;
+        stopped = false;
+        emptyTop = 0;
+
+        showCard(true);
+        mainBtn.textContent = 'Stop';
+        mainBtn.style.background = '#dc2626';
+        mainBtn.style.borderColor = '#dc2626';
+        mainBtn.style.color = '#ffffff';
+
+        updatePanel('Starting...', 'busy');
+        runMainLoop();
+    }
+
+    function stopRun(msg, type) {
+        stopped = true;
+        running = false;
+        paused = false;
+        pauseBtn.textContent = 'Pause';
+        mainBtn.textContent = 'Start';
+        applyTheme();
+        updatePanel(msg, type || 'warn');
+    }
+
+    function togglePause() {
+        if (!running) return;
+        paused = !paused;
+        if (paused) {
+            pauseBtn.textContent = 'Resume';
+            pauseBtn.style.background = '#d97706';
+            pauseBtn.style.borderColor = '#d97706';
+            pauseBtn.style.color = '#ffffff';
+            updatePanel('Paused', 'warn');
+        } else {
+            pauseBtn.textContent = 'Pause';
+            applyTheme();
+            updatePanel('Working...', 'busy');
+        }
+    }
+
+    // =========================================================================
+    // MAIN LOOP
+    // =========================================================================
+    async function runMainLoop() {
+        log('Started on chat:', lockedConvId);
+
+        // Start from the newest messages
+        const sc = getScroller();
+        if (sc) {
+            sc.scrollTop = sc.scrollHeight;
+            await sleep(500);
+        }
+
+        while (running && !stopped) {
+            while (paused && running && !stopped) await sleep(150);
+            if (!running || stopped) break;
+
+            // Stop if the chat changed (protects other chats)
+            const cur = getConvId();
+            if (cur && cur !== lockedConvId) {
+                stopRun('Stopped: chat changed', 'warn');
+                break;
+            }
+
+            const el = pickNext();
+
+            if (!el) {
+                updatePanel('Looking for older messages...', 'busy');
+                const r = await goUp();
+                if (r === 'finished') {
+                    stopRun(`Finished. Done: ${stats.totalCleaned}`, 'success');
+                    break;
+                }
+                continue;
+            }
+
+            emptyTop = 0;
+            const preview = getPreview(el);
+            const msgDate = findMessageDate(el); // read before the message disappears
+            const result = await processMessage(el);
+
+            if (getConvId() !== lockedConvId) {
+                stopRun('Stopped: chat changed', 'warn');
+                break;
+            }
+
+            if (result === 'success') {
+                // mark as handled; if it turns into an "unsent" notice its signature
+                // changes and it will be picked up again
+                if (el.isConnected) doneMap.set(el, signature(el));
+                log(`Done: ${preview} (Total: ${stats.totalCleaned})`);
+                updatePanel(`Done: ${stats.totalCleaned}`, 'success', 'Unsend completed' + (msgDate ? ' \u00b7 ' + msgDate : ''));
+            } else if (result === 'retry') {
+                const n = (triesMap.get(el) || 0) + 1;
+                triesMap.set(el, n);
+                if (n >= CONFIG.MAX_RETRIES) {
+                    stats.skipped++;
+                    doneMap.set(el, signature(el));
+                    log('Skipped:', preview);
+                }
+                await sleep(CONFIG.RETRY_DELAY);
+            } else {
+                doneMap.set(el, signature(el));
+            }
+
+            await sleep(CONFIG.LOOP_DELAY);
+        }
+        log('Stopped.');
+    }
+
+    // =========================================================================
+    // START
+    // =========================================================================
+    const initTimer = setInterval(() => {
+        if (document.body) {
+            clearInterval(initTimer);
+            buildUI();
+            log('G+ Unsender v1.0 ready.');
+        }
+    }, 400);
+
+    // Keep the G+ button in the header and keep its color in sync
+    setInterval(mountHeaderButton, 600);
+})();
