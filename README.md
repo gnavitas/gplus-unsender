@@ -1,8 +1,8 @@
 # G+ Unsender
 
-A userscript that clears out a Messenger conversation for you. It unsends your own messages, removes the "You unsent a message" leftovers, and can also remove other people's messages from your side. It runs in the browser on messenger.com and facebook.com/messages.
+A userscript that clears out a Messenger conversation for you. It unsends your own messages, removes the "You unsent a message" leftovers, and can also remove other people's messages from your side. It runs in the browser on messenger.com and facebook.com/messages. Version 1.0.
 
-Version 1.0
+
 <img width="492" height="480" alt="Screen Recording 2026-10-21 065637 (online-video-cutter com)" src="https://github.com/user-attachments/assets/21734ff0-e55a-4e76-8080-c4ef2785ed40" />
 
 
