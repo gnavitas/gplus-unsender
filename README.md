@@ -4,6 +4,10 @@ A userscript that clears out a Messenger conversation for you. It unsends your o
 
 Version 1.0
 
+
+
+![Uploading Screen Recording 2026-10-21 065637 (online-video-cutter.com).gif…]()
+
 ## Install
 
 1. Install a userscript manager such as Tampermonkey or Violentmonkey.
